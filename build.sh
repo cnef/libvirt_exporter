@@ -1,0 +1,1 @@
+docker build -t registry-local.kubeup.cn/ekos/libvirt-exporter .

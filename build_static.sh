@@ -4,6 +4,7 @@ docker run -i -v `pwd`:/gopath/src/github.com/kumina/libvirt_exporter alpine:3.8
 set -ex
 
 # Install prerequisites for the build process.
+sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
 apk update
 apk add ca-certificates g++ git go libnl-dev linux-headers make perl pkgconf libtirpc-dev wget
 update-ca-certificates

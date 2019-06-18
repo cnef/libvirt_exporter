@@ -2,6 +2,7 @@
 FROM golang:alpine
 
 # Install dependencies
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
 RUN apk add --update git gcc g++ make libc-dev portablexdr-dev linux-headers libnl-dev perl libtirpc-dev pkgconfig wget
 RUN wget ftp://xmlsoft.org/libxml2/libxml2-2.9.4.tar.gz -P /tmp && \
     tar -xf /tmp/libxml2-2.9.4.tar.gz -C /tmp
@@ -24,8 +25,8 @@ WORKDIR $LIBVIRT_EXPORTER_PATH
 COPY . .
 
 # Build and strip exporter
-RUN go get -d ./... && \
-    go build --ldflags '-extldflags "-static"' && \
+#go get -d ./... && \
+RUN go build --ldflags '-extldflags "-static"' && \
     strip libvirt_exporter
 
 # Stage 2: Prepare final image
