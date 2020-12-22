@@ -1,5 +1,5 @@
 # Stage 1: Build libvirt exporter
-FROM golang:alpine
+FROM golang:1.12.17-alpine3.10
 
 # Install dependencies
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
