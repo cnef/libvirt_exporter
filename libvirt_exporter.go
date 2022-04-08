@@ -434,7 +434,7 @@ func (e *LibvirtExporter) CollectDomain(ch chan<- prometheus.Metric, domainId ui
 	ch <- prometheus.MustNewConstMetric(
 		e.libvirtDomainInfoCpuUsageDesc,
 		prometheus.CounterValue,
-		cpuUsage,
+		cpuUsage/1e9,
 		domainLabelValues...)
 
 	// Report block device statistics.
