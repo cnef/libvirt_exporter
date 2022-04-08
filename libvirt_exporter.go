@@ -18,6 +18,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/kumina/libvirt_exporter/libvirt_schema"
 	"github.com/libvirt/libvirt-go"
@@ -26,10 +28,17 @@ import (
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
+type cpuTime struct {
+	lastUpdate time.Time
+	cpuTime    uint64
+}
+
 // LibvirtExporter implements a Prometheus exporter for libvirt state.
 type LibvirtExporter struct {
 	uri                string
 	exportNovaMetadata bool
+	pastCPUTimes       map[uint32]cpuTime
+	locker             sync.Mutex
 
 	libvirtUpDesc *prometheus.Desc
 
@@ -37,6 +46,7 @@ type LibvirtExporter struct {
 	libvirtDomainInfoMemoryDesc    *prometheus.Desc
 	libvirtDomainInfoNrVirtCpuDesc *prometheus.Desc
 	libvirtDomainInfoCpuTimeDesc   *prometheus.Desc
+	libvirtDomainInfoCpuUsageDesc  *prometheus.Desc
 
 	libvirtDomainBlockAllocationDesc   *prometheus.Desc
 	libvirtDomainBlockCapacityDesc     *prometheus.Desc
@@ -81,6 +91,9 @@ func NewLibvirtExporter(uri string, exportNovaMetadata bool) (*LibvirtExporter, 
 	return &LibvirtExporter{
 		uri:                uri,
 		exportNovaMetadata: exportNovaMetadata,
+		pastCPUTimes:       map[uint32]cpuTime{},
+		locker:             sync.Mutex{},
+
 		libvirtUpDesc: prometheus.NewDesc(
 			prometheus.BuildFQName("libvirt", "", "up"),
 			"Whether scraping libvirt's metrics was successful.",
@@ -104,6 +117,11 @@ func NewLibvirtExporter(uri string, exportNovaMetadata bool) (*LibvirtExporter, 
 		libvirtDomainInfoCpuTimeDesc: prometheus.NewDesc(
 			prometheus.BuildFQName("libvirt", "domain_info", "cpu_time_seconds_total"),
 			"Amount of CPU time used by the domain, in seconds.",
+			domainLabels,
+			nil),
+		libvirtDomainInfoCpuUsageDesc: prometheus.NewDesc(
+			prometheus.BuildFQName("libvirt", "domain_info", "cpu_usage"),
+			"CPU usage by the domain, in seconds.",
 			domainLabels,
 			nil),
 
@@ -271,6 +289,7 @@ func (e *LibvirtExporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.libvirtDomainInfoMemoryDesc
 	ch <- e.libvirtDomainInfoNrVirtCpuDesc
 	ch <- e.libvirtDomainInfoCpuTimeDesc
+	ch <- e.libvirtDomainInfoCpuUsageDesc
 
 	ch <- e.libvirtDomainBlockRdBytesDesc
 	ch <- e.libvirtDomainBlockRdReqDesc
@@ -328,7 +347,7 @@ func (e *LibvirtExporter) CollectFromLibvirt(ch chan<- prometheus.Metric) error 
 	for _, id := range domainIds {
 		domain, err := conn.LookupDomainById(id)
 		if err == nil {
-			err = e.CollectDomain(ch, domain)
+			err = e.CollectDomain(ch, id, domain)
 			domain.Free()
 			if err != nil {
 				return err
@@ -340,7 +359,7 @@ func (e *LibvirtExporter) CollectFromLibvirt(ch chan<- prometheus.Metric) error 
 }
 
 // CollectDomain extracts Prometheus metrics from a libvirt domain.
-func (e *LibvirtExporter) CollectDomain(ch chan<- prometheus.Metric, domain *libvirt.Domain) error {
+func (e *LibvirtExporter) CollectDomain(ch chan<- prometheus.Metric, domainId uint32, domain *libvirt.Domain) error {
 	// Decode XML description of domain to get block device names, etc.
 	xmlDesc, err := domain.GetXMLDesc(0)
 	if err != nil {
@@ -376,6 +395,8 @@ func (e *LibvirtExporter) CollectDomain(ch chan<- prometheus.Metric, domain *lib
 	if err != nil {
 		return err
 	}
+	timeNow := time.Now()
+
 	ch <- prometheus.MustNewConstMetric(
 		e.libvirtDomainInfoMaxMemDesc,
 		prometheus.GaugeValue,
@@ -395,6 +416,25 @@ func (e *LibvirtExporter) CollectDomain(ch chan<- prometheus.Metric, domain *lib
 		e.libvirtDomainInfoCpuTimeDesc,
 		prometheus.CounterValue,
 		float64(info.CpuTime)/1e9,
+		domainLabelValues...)
+
+	e.locker.Lock()
+	cpuUsage := 0.0
+	if past, ok := e.pastCPUTimes[domainId]; ok {
+		seconds := timeNow.Sub(past.lastUpdate).Seconds()
+		if seconds > 0 {
+			cpuUsage = float64(info.CpuTime-past.cpuTime) / seconds
+		}
+	}
+	e.pastCPUTimes[domainId] = cpuTime{
+		lastUpdate: timeNow,
+		cpuTime:    info.CpuTime,
+	}
+	e.locker.Unlock()
+	ch <- prometheus.MustNewConstMetric(
+		e.libvirtDomainInfoCpuUsageDesc,
+		prometheus.CounterValue,
+		cpuUsage,
 		domainLabelValues...)
 
 	// Report block device statistics.
@@ -630,6 +670,44 @@ func (e *LibvirtExporter) CollectDomain(ch chan<- prometheus.Metric, domain *lib
 	return nil
 }
 
+func (e *LibvirtExporter) collectCPUUsage() error {
+	conn, err := libvirt.NewConnect(e.uri)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Use ListDomains() as opposed to using ListAllDomains(), as
+	// the latter is unsupported when talking to a system using
+	// libvirt 0.9.12 or older.
+	domainIds, err := conn.ListDomains()
+	if err != nil {
+		return err
+	}
+	for _, id := range domainIds {
+		domain, err := conn.LookupDomainById(id)
+		if err == nil {
+			// Report domain info.
+			info, err := domain.GetInfo()
+			if err != nil {
+				return err
+			}
+			domain.Free()
+			if err != nil {
+				return err
+			}
+			e.locker.Lock()
+			e.pastCPUTimes[id] = cpuTime{
+				lastUpdate: time.Now(),
+				cpuTime:    info.CpuTime,
+			}
+			e.locker.Unlock()
+		}
+	}
+
+	return nil
+}
+
 func MemoryStatCollect(memorystat *[]libvirt.DomainMemoryStat) libvirt_schema.VirDomainMemoryStats {
 	var MemoryStats libvirt_schema.VirDomainMemoryStats
 	for _, domainmemorystat := range *memorystat {
@@ -669,6 +747,14 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	go func() {
+		for {
+			if err := exporter.collectCPUUsage(); err != nil {
+				log.Println("collectCPUUsage error:", err)
+			}
+			time.Sleep(3 * time.Second)
+		}
+	}()
 	prometheus.MustRegister(exporter)
 
 	http.Handle(*metricsPath, promhttp.Handler())
